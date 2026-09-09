@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Code bracket left: < -->
+    <path
+        android:pathData="M34,44 L25,54 L34,64"
+        android:strokeWidth="3.5"
+        android:strokeColor="#38BDF8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Code bracket right: > -->
+    <path
+        android:pathData="M74,44 L83,54 L74,64"
+        android:strokeWidth="3.5"
+        android:strokeColor="#A855F7"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000" />
+
+    <!-- Infinity loop -->
+    <path
+        android:pathData="M54,54 C48,46 40,46 36,50 C32,54 32,60 37,64 C42,67 48,61 54,54 C60,47 66,41 71,44 C76,48 76,54 72,58 C68,62 60,62 54,54 Z"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:fillColor="#00000000">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="28"
+                android:startY="42"
+                android:endX="80"
+                android:endY="66"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#00F0FF" />
+                <item android:offset="0.5" android:color="#6366F1" />
+                <item android:offset="1.0" android:color="#D946EF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Center tech spark -->
+    <path
+        android:pathData="M54,51 L55,53 L57,54 L55,55 L54,57 L53,55 L51,54 L53,53 Z"
+        android:fillColor="#FFFFFF" />
+</vector>

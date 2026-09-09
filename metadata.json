@@ -1,0 +1,6 @@
+{
+  "name": "Infinity Agent",
+  "description": "Powerful AI coding suite with multi-model intelligence, autonomous agent workflow, file system access, and diff viewer",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
