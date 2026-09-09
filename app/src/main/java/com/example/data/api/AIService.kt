@@ -56,7 +56,32 @@ class AIService {
         messages: List<MessagePayload>,
         systemPrompt: String? = null
     ): Flow<AIStreamChunk> = flow {
-        val apiKey = getApiKeyForModel(modelType)
+        val nvKey = getApiKeyForModel(modelType)
+        val geminiKey = BuildConfig.GEMINI_API_KEY
+
+        // Check if we should use Gemini API directly or if NV key is missing/default
+        val shouldUseGemini = modelType == AIModelType.GEMINI_PRO || 
+            ((nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_"))
+
+        if (shouldUseGemini && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_")) {
+            if (modelType != AIModelType.GEMINI_PRO && (nvKey.isBlank() || nvKey.startsWith("DEFAULT_"))) {
+                emit(AIStreamChunk(textChunk = "*(Using Gemini 2.5 Flash as ${modelType.displayName} key is unconfigured)*\n\n"))
+            }
+            streamGemini(geminiKey, messages, systemPrompt).collect { emit(it) }
+            return@flow
+        }
+
+        // Check if NV key is missing
+        if (nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) {
+            emit(
+                AIStreamChunk(
+                    textChunk = "⚠️ **API Key Required**\n\nNo valid API key found for **${modelType.displayName}**.\n\nPlease configure your `GEMINI_API_KEY` or `NV_KEY_*` credentials in the **Secrets** panel in AI Studio.",
+                    isFinished = true
+                )
+            )
+            return@flow
+        }
+
         val requestJson = JSONObject()
         val messagesArray = JSONArray()
 
@@ -117,7 +142,7 @@ class AIService {
 
         val request = Request.Builder()
             .url(baseUrl)
-            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Authorization", "Bearer $nvKey")
             .addHeader("Accept", "text/event-stream")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
             .build()
@@ -127,8 +152,13 @@ class AIService {
         try {
             val response = client.newCall(request).execute()
             if (!response.isSuccessful || response.body == null) {
-                // Graceful fallback simulation if key or quota fails
-                emit(simulateFallback(modelType, messages.lastOrNull()?.text ?: ""))
+                val errorBody = response.body?.string()?.take(500) ?: response.message
+                emit(
+                    AIStreamChunk(
+                        textChunk = "⚠️ **API Error (HTTP ${response.code})**: $errorBody\n\nPlease check your API credentials in the Secrets panel.",
+                        isFinished = true
+                    )
+                )
                 return@flow
             }
 
@@ -168,20 +198,136 @@ class AIService {
                 line = reader.readLine()
             }
             if (!hasEmittedContent) {
-                emit(simulateFallback(modelType, messages.lastOrNull()?.text ?: ""))
+                emit(AIStreamChunk(textChunk = "⚠️ Stream completed without response content.", isFinished = true))
             }
         } catch (e: Exception) {
-            // High resiliency: produce offline/smart fallback result if network is unreachable
-            emit(simulateFallback(modelType, messages.lastOrNull()?.text ?: ""))
+            emit(AIStreamChunk(textChunk = "⚠️ Network Connection Error: ${e.localizedMessage ?: e.message}", isFinished = true))
         }
     }.flowOn(Dispatchers.IO)
+
+    private fun streamGemini(
+        apiKey: String,
+        messages: List<MessagePayload>,
+        systemPrompt: String?
+    ): Flow<AIStreamChunk> = flow {
+        val geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=$apiKey"
+        val requestJson = JSONObject()
+
+        if (!systemPrompt.isNullOrBlank()) {
+            val sysObj = JSONObject()
+            val sysParts = JSONArray().apply {
+                put(JSONObject().apply { put("text", systemPrompt) })
+            }
+            sysObj.put("parts", sysParts)
+            requestJson.put("systemInstruction", sysObj)
+        }
+
+        val contentsArray = JSONArray()
+        for (msg in messages) {
+            val contentObj = JSONObject()
+            contentObj.put("role", if (msg.role == "assistant" || msg.role == "model") "model" else "user")
+            val partsArray = JSONArray()
+
+            if (msg.text.isNotEmpty()) {
+                partsArray.put(JSONObject().apply { put("text", msg.text) })
+            }
+
+            if (msg.imageBase64 != null) {
+                val inlineData = JSONObject().apply {
+                    put("mimeType", "image/jpeg")
+                    put("data", msg.imageBase64)
+                }
+                partsArray.put(JSONObject().apply { put("inlineData", inlineData) })
+            }
+
+            if (partsArray.length() > 0) {
+                contentObj.put("parts", partsArray)
+                contentsArray.put(contentObj)
+            }
+        }
+        requestJson.put("contents", contentsArray)
+
+        val genConfig = JSONObject().apply {
+            put("temperature", 0.7)
+            put("maxOutputTokens", 8192)
+        }
+        requestJson.put("generationConfig", genConfig)
+
+        val request = Request.Builder()
+            .url(geminiUrl)
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Accept", "text/event-stream")
+            .post(requestJson.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        var hasEmittedContent = false
+
+        try {
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful || response.body == null) {
+                val errorBody = response.body?.string()?.take(500) ?: response.message
+                emit(AIStreamChunk(textChunk = "⚠️ Gemini API Error (HTTP ${response.code}): $errorBody", isFinished = true))
+                return@flow
+            }
+
+            val reader = BufferedReader(InputStreamReader(response.body!!.byteStream()))
+            var line: String? = reader.readLine()
+            while (line != null) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("data: ")) {
+                    val data = trimmed.substring(6).trim()
+                    try {
+                        val chunkObj = JSONObject(data)
+                        val candidates = chunkObj.optJSONArray("candidates")
+                        if (candidates != null && candidates.length() > 0) {
+                            val candidate = candidates.getJSONObject(0)
+                            val content = candidate.optJSONObject("content")
+                            val parts = content?.optJSONArray("parts")
+                            if (parts != null) {
+                                for (i in 0 until parts.length()) {
+                                    val part = parts.getJSONObject(i)
+                                    if (part.has("text")) {
+                                        val text = part.getString("text")
+                                        if (text.isNotEmpty()) {
+                                            hasEmittedContent = true
+                                            emit(AIStreamChunk(textChunk = text))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                line = reader.readLine()
+            }
+            if (!hasEmittedContent) {
+                emit(AIStreamChunk(textChunk = "⚠️ Empty response received from Gemini API.", isFinished = true))
+            }
+        } catch (e: Exception) {
+            emit(AIStreamChunk(textChunk = "⚠️ Gemini Connection Error: ${e.localizedMessage ?: e.message}", isFinished = true))
+        }
+    }
 
     suspend fun executeSinglePrompt(
         modelType: AIModelType,
         prompt: String,
         systemPrompt: String? = null
     ): String = withContext(Dispatchers.IO) {
-        val apiKey = getApiKeyForModel(modelType)
+        val nvKey = getApiKeyForModel(modelType)
+        val geminiKey = BuildConfig.GEMINI_API_KEY
+
+        val shouldUseGemini = modelType == AIModelType.GEMINI_PRO || 
+            ((nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_"))
+
+        if (shouldUseGemini && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_")) {
+            return@withContext executeGeminiPrompt(geminiKey, prompt, systemPrompt)
+        }
+
+        if (nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) {
+            return@withContext "⚠️ API Key Required: Please configure NV_KEY or GEMINI_API_KEY in the Secrets panel."
+        }
+
         val requestJson = JSONObject()
         val messagesArray = JSONArray()
 
@@ -204,7 +350,7 @@ class AIService {
 
         val request = Request.Builder()
             .url(baseUrl)
-            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Authorization", "Bearer $nvKey")
             .addHeader("Accept", "application/json")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
             .build()
@@ -218,92 +364,75 @@ class AIService {
                     val msg = choices.getJSONObject(0).getJSONObject("message")
                     return@withContext msg.optString("content", "")
                 }
+            } else {
+                val err = response.body?.string()?.take(300) ?: response.message
+                return@withContext "⚠️ API Error (HTTP ${response.code}): $err"
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            return@withContext "⚠️ Network Error: ${e.localizedMessage ?: e.message}"
         }
-        return@withContext simulateFallback(modelType, prompt).textChunk
+        return@withContext "⚠️ No response returned from API."
     }
 
-    private fun simulateFallback(modelType: AIModelType, prompt: String): AIStreamChunk {
-        val cleanPrompt = prompt.lowercase()
-        val response = when {
-            cleanPrompt.contains("explain") -> """### Code Analysis & Architecture
+    private fun executeGeminiPrompt(
+        apiKey: String,
+        prompt: String,
+        systemPrompt: String?
+    ): String {
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+        val requestJson = JSONObject()
 
-This implementation demonstrates clean modular patterns with separation of concerns:
-
-1. **State Isolation**: Encapsulates reactive variables within observable flows to prevent race conditions.
-2. **Computational Complexity**: Achieves optimal O(N) linear performance while maintaining O(1) auxiliary space.
-3. **Robustness**: Enforces defensive null checks and strict exception handling boundaries.
-
-```kotlin
-// Example idiomatic pattern
-fun executeCleanly(input: String): Result<String> {
-    return runCatching {
-        require(input.isNotBlank()) { "Input must not be empty" }
-        input.trim().uppercase()
-    }
-}
-```
-"""
-            cleanPrompt.contains("debug") -> """### Debug & Resolution Diagnostics
-
-**Identified Issues:**
-1. Potential `IndexOutOfBoundsException` on empty container access.
-2. Unsynchronized state mutation across concurrent dispatchers.
-
-**Recommended Fix:**
-```cpp
-// Patched memory-safe implementation
-std::vector<int> safeFilter(const std::vector<int>& data) {
-    std::vector<int> result;
-    result.reserve(data.size());
-    for (const auto& item : data) {
-        if (item > 0) {
-            result.push_back(item);
+        if (!systemPrompt.isNullOrBlank()) {
+            val sysObj = JSONObject()
+            val sysParts = JSONArray().apply {
+                put(JSONObject().apply { put("text", systemPrompt) })
+            }
+            sysObj.put("parts", sysParts)
+            requestJson.put("systemInstruction", sysObj)
         }
-    }
-    return result;
-}
-```
-All assertions verified against boundary edge-cases.
-"""
-            cleanPrompt.contains("refactor") || cleanPrompt.contains("optimize") -> """### Optimized Architecture Refactor
 
-Refactored for zero-allocation performance and declarative composition:
-
-```java
-public final class HighThroughputEngine {
-    private final int[] buffer;
-
-    public HighThroughputEngine(int capacity) {
-        this.buffer = new int[capacity];
-    }
-
-    public int computeSum(int length) {
-        int sum = 0;
-        for (int i = 0; i < length; i++) {
-            sum += buffer[i];
+        val contentsArray = JSONArray()
+        val contentObj = JSONObject().apply {
+            put("role", "user")
+            put("parts", JSONArray().apply {
+                put(JSONObject().apply { put("text", prompt) })
+            })
         }
-        return sum;
-    }
-}
-```
-"""
-            else -> """### Infinity Synthesis
+        contentsArray.put(contentObj)
+        requestJson.put("contents", contentsArray)
 
-Engineered solution for: **${prompt.take(60)}**
-
-```kotlin
-class SolutionEngine {
-    fun execute(): Boolean {
-        // Optimized high-performance logic
-        return true
-    }
-}
-```
-Ready to integrate with your local project workspace.
-"""
+        val genConfig = JSONObject().apply {
+            put("temperature", 0.7)
+            put("maxOutputTokens", 4096)
         }
-        return AIStreamChunk(textChunk = response, isFinished = true)
+        requestJson.put("generationConfig", genConfig)
+
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("Content-Type", "application/json")
+            .post(requestJson.toString().toRequestBody(jsonMediaType))
+            .build()
+
+        return try {
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful && response.body != null) {
+                val json = JSONObject(response.body!!.string())
+                val candidates = json.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val candidate = candidates.getJSONObject(0)
+                    val content = candidate.optJSONObject("content")
+                    val parts = content?.optJSONArray("parts")
+                    if (parts != null && parts.length() > 0) {
+                        return parts.getJSONObject(0).optString("text", "")
+                    }
+                }
+                "⚠️ Empty candidate in Gemini response."
+            } else {
+                val err = response.body?.string()?.take(300) ?: response.message
+                "⚠️ Gemini API Error (HTTP ${response.code}): $err"
+            }
+        } catch (e: Exception) {
+            "⚠️ Gemini Connection Error: ${e.localizedMessage ?: e.message}"
+        }
     }
 }

@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -22,11 +23,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.example.data.db.ChatMessageEntity
 import com.example.data.db.ProjectFileEntity
 import com.example.data.model.AIModelType
@@ -37,6 +40,7 @@ import com.example.ui.components.FloatingChatComposer
 import com.example.ui.components.SyntaxHighlightedCodeBlock
 import com.example.ui.theme.*
 import kotlinx.coroutines.launch
+import java.io.File
 
 @Composable
 fun ChatScreen(
@@ -49,11 +53,13 @@ fun ChatScreen(
     val currentModel by viewModel.currentModel.collectAsState()
     val chatInputText by viewModel.chatInputText.collectAsState()
     val attachedFile by viewModel.attachedFile.collectAsState()
+    val attachedImageUri by viewModel.attachedImageUri.collectAsState()
     val projectFiles by viewModel.currentProjectFiles.collectAsState()
 
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var showFileSelectorDialog by remember { mutableStateOf(false) }
+    var previewImageUri by remember { mutableStateOf<String?>(null) }
 
     // Android Storage Access Framework launcher
     val filePickerLauncher = rememberLauncherForActivityResult(
@@ -62,8 +68,8 @@ fun ChatScreen(
         uri?.let { viewModel.importLocalFile(it) }
     }
 
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         uri?.let { viewModel.attachImage(it) }
     }
@@ -157,6 +163,9 @@ fun ChatScreen(
                             message = message,
                             onApplyDiff = { diff ->
                                 viewModel.applyDiffToProject(diff)
+                            },
+                            onPreviewImage = { uri ->
+                                previewImageUri = uri
                             }
                         )
                     }
@@ -172,13 +181,66 @@ fun ChatScreen(
             isGenerating = isGenerating,
             onStopGenerating = { viewModel.stopGenerating() },
             onTriggerFilePicker = { showFileSelectorDialog = true },
-            onTriggerImagePicker = { imagePickerLauncher.launch("image/*") },
+            onTriggerImagePicker = {
+                photoPickerLauncher.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                )
+            },
             attachedFile = attachedFile,
             onRemoveAttachment = { viewModel.clearAttachment() },
+            attachedImageUri = attachedImageUri,
+            onRemoveImage = { viewModel.clearImage() },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
         )
+    }
+
+    // Full screen image preview dialog
+    previewImageUri?.let { imgUri ->
+        Dialog(
+            onDismissRequest = { previewImageUri = null },
+            properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.92f))
+                    .clickable { previewImageUri = null }
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val context = LocalContext.current
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(File(imgUri).takeIf { it.exists() } ?: imgUri)
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = "Full picture preview",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .wrapContentHeight()
+                        .clip(RoundedCornerShape(16.dp)),
+                    contentScale = ContentScale.Fit
+                )
+
+                IconButton(
+                    onClick = { previewImageUri = null },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 28.dp, end = 12.dp)
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.6f))
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Close preview",
+                        tint = Color.White
+                    )
+                }
+            }
+        }
     }
 
     // "@" File Attachment Selector Dialog
@@ -207,7 +269,8 @@ fun ChatScreen(
 @Composable
 fun ChatMessageItem(
     message: ChatMessageEntity,
-    onApplyDiff: (FileDiff) -> Unit
+    onApplyDiff: (FileDiff) -> Unit,
+    onPreviewImage: (String) -> Unit = {}
 ) {
     val isUser = message.role == "user"
 
@@ -256,15 +319,79 @@ fun ChatMessageItem(
             Column(modifier = Modifier.padding(14.dp)) {
                 // Image preview if attached
                 if (message.imageUri != null) {
-                    AsyncImage(
-                        model = message.imageUri,
-                        contentDescription = "Attached Image",
+                    val context = LocalContext.current
+                    var imageLoadFailed by remember { mutableStateOf(false) }
+
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(180.dp)
-                            .clip(RoundedCornerShape(12.dp)),
-                        contentScale = ContentScale.Crop
-                    )
+                            .heightIn(min = 100.dp, max = 240.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surface)
+                            .clickable { onPreviewImage(message.imageUri) },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AsyncImage(
+                            model = ImageRequest.Builder(context)
+                                .data(File(message.imageUri).takeIf { it.exists() } ?: message.imageUri)
+                                .crossfade(true)
+                                .build(),
+                            contentDescription = "Attached Image (Tap to zoom)",
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 100.dp, max = 240.dp),
+                            contentScale = ContentScale.Crop,
+                            onError = { imageLoadFailed = true },
+                            onSuccess = { imageLoadFailed = false }
+                        )
+
+                        if (imageLoadFailed) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.BrokenImage,
+                                    contentDescription = null,
+                                    tint = AccentRose,
+                                    modifier = Modifier.size(32.dp)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Image preview unavailable",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AccentRose
+                                )
+                            }
+                        } else {
+                            // Subtle zoom badge
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(6.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color.Black.copy(alpha = 0.6f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.ZoomIn,
+                                        contentDescription = "Zoom",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        text = "Zoom",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                        color = Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
                     Spacer(modifier = Modifier.height(8.dp))
                 }
 

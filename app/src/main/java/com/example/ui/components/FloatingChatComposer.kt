@@ -27,8 +27,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
 import com.example.data.model.AttachedFileRef
 import com.example.ui.theme.*
+import java.io.File
 
 @Composable
 fun FloatingChatComposer(
@@ -41,6 +43,8 @@ fun FloatingChatComposer(
     onTriggerImagePicker: () -> Unit,
     attachedFile: AttachedFileRef?,
     onRemoveAttachment: () -> Unit,
+    attachedImageUri: String? = null,
+    onRemoveImage: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val haptic = LocalHapticFeedback.current
@@ -90,6 +94,56 @@ fun FloatingChatComposer(
                                 .size(16.dp)
                                 .clickable { onRemoveAttachment() }
                         )
+                    }
+                }
+            }
+
+            // Attached Picture Pill & Thumbnail (if any)
+            AnimatedVisibility(visible = attachedImageUri != null) {
+                attachedImageUri?.let { imgPath ->
+                    Row(
+                        modifier = Modifier
+                            .padding(bottom = 6.dp, start = 8.dp, end = 8.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(AccentPurple.copy(alpha = 0.12f))
+                            .border(1.dp, AccentPurple.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        AsyncImage(
+                            model = File(imgPath).takeIf { it.exists() } ?: imgPath,
+                            contentDescription = "Attached image preview",
+                            modifier = Modifier
+                                .size(36.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f, fill = false)) {
+                            Text(
+                                text = "Picture Attached",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = AccentPurple,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Vision multimodal analysis active",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        IconButton(
+                            onClick = onRemoveImage,
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Remove attached picture",
+                                tint = AccentPurple,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
             }

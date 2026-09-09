@@ -195,13 +195,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val inputStream: InputStream? = context.contentResolver.openInputStream(uri)
                 val bytes = inputStream?.readBytes()
                 inputStream?.close()
-                if (bytes != null) {
+                if (bytes != null && bytes.isNotEmpty()) {
+                    val imagesDir = java.io.File(context.cacheDir, "attached_images").apply { mkdirs() }
+                    val imageFile = java.io.File(imagesDir, "img_${System.currentTimeMillis()}.jpg")
+                    imageFile.writeBytes(bytes)
                     val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
                     _attachedImageBase64.value = base64
-                    _attachedImageUri.value = uri.toString()
+                    _attachedImageUri.value = imageFile.absolutePath
                     _currentModel.value = AIModelType.VISION_STUDIO
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                android.util.Log.e("MainViewModel", "Failed to attach image", e)
             }
         }
     }
@@ -265,10 +269,22 @@ $text"""
 
             val history = chatRepository.getMessages(session).first().takeLast(6)
             val payloads = history.map { msg ->
+                val resolvedBase64 = when {
+                    msg.imageUri == imgUri && imgBase64 != null -> imgBase64
+                    msg.imageUri != null -> {
+                        try {
+                            val f = java.io.File(msg.imageUri)
+                            if (f.exists()) Base64.encodeToString(f.readBytes(), Base64.NO_WRAP) else null
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    else -> null
+                }
                 MessagePayload(
                     role = if (msg.role == "user") "user" else "assistant",
                     text = msg.content,
-                    imageBase64 = if (msg.imageUri != null) imgBase64 else null
+                    imageBase64 = resolvedBase64
                 )
             }
 
