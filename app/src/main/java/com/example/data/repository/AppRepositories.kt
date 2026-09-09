@@ -26,16 +26,28 @@ class ProjectRepository(
         )
     }
 
-    suspend fun createFile(projectId: Long, name: String, path: String, content: String, language: String): Long {
+    suspend fun createFile(
+        projectId: Long,
+        name: String,
+        path: String,
+        content: String,
+        language: String,
+        realUri: String? = null
+    ): Long {
         return projectFileDao.insertFile(
             ProjectFileEntity(
                 projectId = projectId,
                 name = name,
                 path = path,
                 content = content,
-                language = language
+                language = language,
+                realUri = realUri
             )
         )
+    }
+
+    suspend fun searchFiles(projectId: Long, query: String): List<ProjectFileEntity> {
+        return projectFileDao.searchFiles(projectId, query)
     }
 
     suspend fun updateFileContent(id: Long, content: String) {
@@ -173,49 +185,72 @@ find_library(log-lib log)
 target_link_libraries(native-lib ${'$'}{log-lib})"""
             )
 
-            // 2. Jetpack Compose Modern Architecture
+            // 2. Android Java + XML Architecture
             val proj2Id = projectDao.insertProject(
                 ProjectEntity(
-                    name = "Jetpack Compose App",
-                    description = "Declarative Kotlin UI with state management and Room DB",
-                    language = "Kotlin"
+                    name = "Android Java + XML App",
+                    description = "Native Android App using Java and XML Layouts",
+                    language = "Java + XML"
                 )
             )
             createFile(
                 projectId = proj2Id,
-                name = "MainActivity.kt",
-                path = "app/src/main/java/com/example/compose/MainActivity.kt",
-                language = "Kotlin",
-                content = """package com.example.compose
+                name = "MainActivity.java",
+                path = "app/src/main/java/com/example/app/MainActivity.java",
+                language = "Java",
+                content = """package com.example.app;
 
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
 
-class MainActivity : ComponentActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    GreetingCard("Infinity Developer")
-                }
-            }
-        }
-    }
-}
+public class MainActivity extends AppCompatActivity {
+    private int counter = 0;
 
-@Composable
-fun GreetingCard(name: String) {
-    Card(modifier = Modifier.padding(16.dp)) {
-        Text("Welcome, ${'$'}name!", modifier = Modifier.padding(16.dp))
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        TextView statusText = findViewById(R.id.status_text);
+        Button actionButton = findViewById(R.id.action_button);
+
+        actionButton.setOnClickListener(v -> {
+            counter++;
+            statusText.setText("Interaction count: " + counter);
+        });
     }
 }"""
+            )
+            createFile(
+                projectId = proj2Id,
+                name = "activity_main.xml",
+                path = "app/src/main/res/layout/activity_main.xml",
+                language = "XML",
+                content = """<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="24dp">
+
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Ready"
+        android:textSize="20sp" />
+
+    <Button
+        android:id="@+id/action_button"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="Increment" />
+
+</LinearLayout>"""
             )
 
             // 3. Multi-Language Fullstack Suite
@@ -286,6 +321,10 @@ class ChatRepository(private val chatDao: ChatDao) {
 
     suspend fun clearSession(sessionId: String) {
         chatDao.clearSession(sessionId)
+    }
+
+    suspend fun deleteMessage(id: Long) {
+        chatDao.deleteMessage(id)
     }
 }
 

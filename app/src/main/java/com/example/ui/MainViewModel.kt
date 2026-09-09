@@ -27,6 +27,21 @@ import kotlinx.coroutines.launch
 import java.io.InputStream
 import java.util.UUID
 
+data class PendingDestructiveAction(
+    val title: String,
+    val description: String,
+    val actionType: String,
+    val targetId: Long,
+    val onConfirm: () -> Unit
+)
+
+data class ToolExecutionResult(
+    val tool: InternalToolType,
+    val success: Boolean,
+    val output: String,
+    val requiresConfirmation: Boolean = false
+)
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
@@ -90,6 +105,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _activeDiff = MutableStateFlow<FileDiff?>(null)
     val activeDiff: StateFlow<FileDiff?> = _activeDiff.asStateFlow()
+
+    // Safety & Destructive Confirmation State
+    private val _pendingDestructiveAction = MutableStateFlow<PendingDestructiveAction?>(null)
+    val pendingDestructiveAction: StateFlow<PendingDestructiveAction?> = _pendingDestructiveAction.asStateFlow()
+
+    private val _lastToolResult = MutableStateFlow<ToolExecutionResult?>(null)
+    val lastToolResult: StateFlow<ToolExecutionResult?> = _lastToolResult.asStateFlow()
 
     // Coder IDE State
     private val _selectedLanguage = MutableStateFlow(SupportedLanguage.JAVA)
@@ -215,6 +237,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _attachedImageUri.value = null
     }
 
+    fun updateChatInputText(text: String) {
+        _chatInputText.value = text
+    }
+
     fun sendMessage() {
         val text = _chatInputText.value.trim()
         if (text.isEmpty() || _isGenerating.value) return
@@ -231,11 +257,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _attachedImageUri.value = null
 
         viewModelScope.launch {
+            // Auto-resolve any @filename reference from active project if not explicitly attached
+            var resolvedAttached = attached
+            if (resolvedAttached == null) {
+                val mentionMatch = Regex("@([a-zA-Z0-9_.-]+)").find(text)
+                if (mentionMatch != null) {
+                    val refName = mentionMatch.groupValues[1]
+                    val matchedFile = currentProjectFiles.value.find { 
+                        it.name.equals(refName, ignoreCase = true) || it.path.endsWith(refName, ignoreCase = true) 
+                    }
+                    if (matchedFile != null) {
+                        resolvedAttached = AttachedFileRef(
+                            name = matchedFile.name,
+                            path = matchedFile.path,
+                            content = matchedFile.content,
+                            realUri = matchedFile.realUri
+                        )
+                    }
+                }
+            }
+
             // Save User Message
-            val userPromptWithFile = if (attached != null) {
-                """Context File: ${attached.path}
-```${attached.name}
-${attached.content}
+            val userPromptWithFile = if (resolvedAttached != null) {
+                """Context File: ${resolvedAttached.path}
+```${resolvedAttached.name}
+${resolvedAttached.content}
 ```
 
 $text"""
@@ -248,8 +294,8 @@ $text"""
                     content = text,
                     modelUsed = model.displayName,
                     imageUri = imgUri,
-                    attachedFileName = attached?.name,
-                    attachedFileContent = attached?.content
+                    attachedFileName = resolvedAttached?.name,
+                    attachedFileContent = resolvedAttached?.content
                 )
             )
 
@@ -281,9 +327,14 @@ $text"""
                     }
                     else -> null
                 }
+                val payloadText = if (msg.role == "user" && msg.id == assistantMsgId - 1 && resolvedAttached != null) {
+                    userPromptWithFile
+                } else {
+                    msg.content
+                }
                 MessagePayload(
                     role = if (msg.role == "user") "user" else "assistant",
-                    text = msg.content,
+                    text = payloadText,
                     imageBase64 = resolvedBase64
                 )
             }
@@ -301,24 +352,53 @@ $text"""
                             chatRepository.updateMessageContent(assistantMsgId, fullResponse)
                         }
                     }
-                    // Check if response contains code diff suggestion for attached file
-                    if (attached != null && fullResponse.contains("```")) {
+                    // Check if response contains code diff suggestion for attached/referenced file
+                    if (resolvedAttached != null && fullResponse.contains("```")) {
                         extractCodeBlock(fullResponse)?.let { newCode ->
                             _activeDiff.value = FileDiff(
-                                filePath = attached.path,
-                                originalContent = attached.content,
+                                filePath = resolvedAttached.path,
+                                originalContent = resolvedAttached.content,
                                 proposedContent = newCode,
-                                changeDescription = "AI suggested modifications"
+                                changeDescription = "AI suggested modifications for ${resolvedAttached.name}"
                             )
                         }
                     }
                 } catch (e: Exception) {
-                    chatRepository.updateMessageContent(assistantMsgId, fullResponse.ifEmpty { "Service response completed." })
+                    chatRepository.updateMessageContent(assistantMsgId, fullResponse.ifEmpty { "Unable to generate a response. Please try again." })
                 } finally {
                     _isGenerating.value = false
                 }
             }
         }
+    }
+
+    fun retryLastMessage() {
+        if (_isGenerating.value) return
+        viewModelScope.launch {
+            val session = _sessionId.value
+            val messages = chatRepository.getMessages(session).first()
+            val lastUserMsg = messages.lastOrNull { it.role == "user" } ?: return@launch
+            val lastAssistantMsg = messages.lastOrNull { it.role == "assistant" }
+            if (lastAssistantMsg != null && lastAssistantMsg.id > lastUserMsg.id) {
+                chatRepository.deleteMessage(lastAssistantMsg.id)
+            }
+            _chatInputText.value = lastUserMsg.content
+            if (lastUserMsg.attachedFileName != null && lastUserMsg.attachedFileContent != null) {
+                _attachedFile.value = AttachedFileRef(
+                    name = lastUserMsg.attachedFileName,
+                    path = lastUserMsg.attachedFileName,
+                    content = lastUserMsg.attachedFileContent
+                )
+            }
+            if (lastUserMsg.imageUri != null) {
+                _attachedImageUri.value = lastUserMsg.imageUri
+            }
+            sendMessage()
+        }
+    }
+
+    fun regenerateLastResponse() {
+        retryLastMessage()
     }
 
     fun stopGenerating() {
@@ -359,48 +439,222 @@ $text"""
         }
     }
 
+    suspend fun executeInternalTool(
+        tool: InternalToolType,
+        params: Map<String, String>,
+        isConfirmed: Boolean = false
+    ): ToolExecutionResult {
+        val projId = _selectedProjectId.value ?: 1L
+        val result = when (tool) {
+            InternalToolType.LIST_FILES -> {
+                val files = currentProjectFiles.value
+                val summary = files.joinToString("\n") { "• ${it.path} (${it.language}, ${it.content.length} chars)" }
+                ToolExecutionResult(tool, true, if (summary.isEmpty()) "No files found in workspace." else "Files in project:\n$summary")
+            }
+            InternalToolType.READ_FILE -> {
+                val targetNameOrPath = params["path"] ?: params["name"] ?: ""
+                val file = currentProjectFiles.value.find { it.path == targetNameOrPath || it.name == targetNameOrPath || it.path.endsWith(targetNameOrPath) }
+                if (file != null) {
+                    ToolExecutionResult(tool, true, "Content of ${file.path}:\n\n${file.content}")
+                } else {
+                    ToolExecutionResult(tool, false, "File not found: $targetNameOrPath")
+                }
+            }
+            InternalToolType.SEARCH_FILES -> {
+                val query = params["query"] ?: ""
+                val matches = projectRepository.searchFiles(projId, query)
+                val summary = matches.joinToString("\n") { "• ${it.name} (${it.path})" }
+                ToolExecutionResult(tool, true, if (summary.isEmpty()) "No matches found for \"$query\"" else "Found ${matches.size} matches:\n$summary")
+            }
+            InternalToolType.CREATE_FILE -> {
+                val name = params["name"] ?: "NewFile.txt"
+                val path = params["path"] ?: name
+                val content = params["content"] ?: ""
+                val lang = params["language"] ?: "Java"
+                val id = projectRepository.createFile(projId, name, path, content, lang)
+                ToolExecutionResult(tool, true, "Created file $name at $path")
+            }
+            InternalToolType.EDIT_FILE -> {
+                val targetPath = params["path"] ?: params["name"] ?: ""
+                val file = currentProjectFiles.value.find { it.path == targetPath || it.name == targetPath || it.path.endsWith(targetPath) }
+                val newContent = params["content"] ?: ""
+                if (file != null) {
+                    projectRepository.updateFileContent(file.id, newContent)
+                    if (file.realUri != null) {
+                        try {
+                            val ctx = getApplication<Application>()
+                            ctx.contentResolver.openOutputStream(Uri.parse(file.realUri), "wt")?.use { out ->
+                                out.write(newContent.toByteArray(Charsets.UTF_8))
+                            }
+                        } catch (_: Exception) {}
+                    }
+                    ToolExecutionResult(tool, true, "Successfully updated file ${file.name}")
+                } else {
+                    ToolExecutionResult(tool, false, "File not found to edit: $targetPath")
+                }
+            }
+            InternalToolType.RENAME_FILE -> {
+                val targetPath = params["path"] ?: params["name"] ?: ""
+                val newName = params["newName"] ?: ""
+                val newPath = params["newPath"] ?: newName
+                val file = currentProjectFiles.value.find { it.path == targetPath || it.name == targetPath }
+                if (file != null && newName.isNotBlank()) {
+                    projectRepository.renameFile(file.id, newName, newPath)
+                    ToolExecutionResult(tool, true, "Renamed ${file.name} to $newName")
+                } else {
+                    ToolExecutionResult(tool, false, "Could not rename $targetPath")
+                }
+            }
+            InternalToolType.CREATE_FOLDER -> {
+                val folderPath = params["path"] ?: params["folder"] ?: "new_folder/"
+                val name = folderPath.trimEnd('/').substringAfterLast('/') + "/"
+                projectRepository.createFile(projId, name, folderPath, "// Directory placeholder", "folder")
+                ToolExecutionResult(tool, true, "Created directory $folderPath")
+            }
+            InternalToolType.DELETE_FILE -> {
+                val targetPath = params["path"] ?: params["name"] ?: ""
+                val file = currentProjectFiles.value.find { it.path == targetPath || it.name == targetPath }
+                if (file != null) {
+                    if (!isConfirmed) {
+                        ToolExecutionResult(
+                            tool = tool,
+                            success = false,
+                            output = "Destructive operation blocked: Confirmation required to delete ${file.name}.",
+                            requiresConfirmation = true
+                        )
+                    } else {
+                        projectRepository.deleteFile(file.id)
+                        ToolExecutionResult(tool, true, "Successfully deleted file ${file.name}")
+                    }
+                } else {
+                    ToolExecutionResult(tool, false, "File not found: $targetPath")
+                }
+            }
+        }
+        _lastToolResult.value = result
+        return result
+    }
+
+    fun requestDeleteFileWithConfirmation(fileId: Long, fileName: String) {
+        _pendingDestructiveAction.value = PendingDestructiveAction(
+            title = "Confirm File Deletion",
+            description = "Are you sure you want to permanently delete \"$fileName\"? This cannot be undone.",
+            actionType = "DELETE_FILE",
+            targetId = fileId,
+            onConfirm = {
+                deleteFile(fileId)
+                _pendingDestructiveAction.value = null
+            }
+        )
+    }
+
+    fun cancelDestructiveAction() {
+        _pendingDestructiveAction.value = null
+    }
+
+    fun confirmDestructiveAction() {
+        _pendingDestructiveAction.value?.onConfirm?.invoke()
+        _pendingDestructiveAction.value = null
+    }
+
     fun startAutonomousAgent(task: String) {
         if (task.isBlank() || _isAgentRunning.value) return
         _agentTaskPrompt.value = task
         _isAgentRunning.value = true
 
+        // 8-stage real tool-based workflow:
+        // Analyze → Plan → Inspect Files → Code → Review → Debug → Diff → Apply
         val steps = listOf(
             AgentStepData("step_1", 1, "Analyze", "Analyzer", "Infinity Ultra", Icons.Default.Psychology),
             AgentStepData("step_2", 2, "Plan", "Architect", "Infinity Architect", Icons.Default.AccountTree),
-            AgentStepData("step_3", 3, "Code", "Coder", "Infinity Flash", Icons.Default.Code),
-            AgentStepData("step_4", 4, "Review", "Reviewer", "Infinity Vision", Icons.AutoMirrored.Filled.FactCheck),
-            AgentStepData("step_5", 5, "Debug", "Debugger", "Infinity Forge", Icons.Default.BugReport),
-            AgentStepData("step_6", 6, "Apply", "Engine", "Infinity Workspace", Icons.Default.CheckCircle)
+            AgentStepData("step_3", 3, "Inspect Files", "Inspector", "Infinity Forge", Icons.Default.FolderOpen, toolBadge = "list files"),
+            AgentStepData("step_4", 4, "Code", "Coder", "Infinity Flash", Icons.Default.Code, toolBadge = "create file"),
+            AgentStepData("step_5", 5, "Review", "Reviewer", "Infinity Ultra", Icons.AutoMirrored.Filled.FactCheck),
+            AgentStepData("step_6", 6, "Debug", "Debugger", "Infinity Forge", Icons.Default.BugReport),
+            AgentStepData("step_7", 7, "Diff", "Diff Engine", "Infinity Vision", Icons.Default.Build, toolBadge = "diff"),
+            AgentStepData("step_8", 8, "Apply", "Apply Engine", "Infinity Workspace", Icons.Default.CheckCircle, toolBadge = "apply")
         )
         _agentSteps.value = steps
 
         currentAgentJob = viewModelScope.launch {
+            var accumulatedArtifact = ""
+            var targetFilePath = "src/Engine.cpp"
+            var originalFileContent = ""
+            var proposedFileContent = ""
+
             for (i in steps.indices) {
                 _currentAgentStepIndex.value = i
                 val step = steps[i]
                 step.status = StepStatus.RUNNING
 
-                val prompt = when (i) {
-                    0 -> "Analyze task requirements and constraints for: $task"
-                    1 -> "Create detailed architecture specifications and plan for: $task"
-                    2 -> "Write production-ready code implementation for: $task"
-                    3 -> "Review the code for security vulnerabilities, race conditions, and performance"
-                    4 -> "Identify boundary edge cases, verify null safety and output assertions"
-                    else -> "Finalize package, verify dependencies and prepare patch for: $task"
+                when (i) {
+                    0 -> {
+                        // 1. Analyze
+                        val prompt = "Analyze software task requirements and architectural constraints for: $task"
+                        val result = aiService.executeSinglePrompt(AIModelType.ULTRA_PRO, prompt)
+                        step.outputText = result
+                        accumulatedArtifact += "\n[Analysis]:\n$result\n"
+                    }
+                    1 -> {
+                        // 2. Plan
+                        val prompt = "Create a detailed technical plan and tool execution roadmap for:\n$accumulatedArtifact"
+                        val result = aiService.executeSinglePrompt(AIModelType.ARCHITECT, prompt)
+                        step.outputText = result
+                        accumulatedArtifact += "\n[Technical Plan]:\n$result\n"
+                    }
+                    2 -> {
+                        // 3. Inspect Files (Executes internal tool: list files)
+                        val toolRes = executeInternalTool(InternalToolType.LIST_FILES, emptyMap())
+                        val prompt = "Based on current workspace files:\n${toolRes.output}\n\nDetermine which files need to be created or modified for:\n$task"
+                        val result = aiService.executeSinglePrompt(AIModelType.CODE_FORGE, prompt)
+                        step.outputText = "${toolRes.output}\n\n$result"
+                        accumulatedArtifact += "\n[Workspace Inspection]:\n${step.outputText}\n"
+                    }
+                    3 -> {
+                        // 4. Code
+                        val prompt = "Write full, high-performance production code implementing the planned features. Specify the target filename (e.g. src/Solution.java):\n$accumulatedArtifact"
+                        val result = aiService.executeSinglePrompt(AIModelType.FLASH_TURBO, prompt)
+                        val code = extractCodeBlock(result) ?: result
+                        step.outputText = result
+                        step.codeResult = code
+                        proposedFileContent = code
+                        accumulatedArtifact += "\n[Code Implementation]:\n$code\n"
+                    }
+                    4 -> {
+                        // 5. Review
+                        val prompt = "Review this code implementation for security, concurrency issues, memory leaks, and performance:\n$proposedFileContent"
+                        val result = aiService.executeSinglePrompt(AIModelType.ULTRA_PRO, prompt)
+                        step.outputText = result
+                    }
+                    5 -> {
+                        // 6. Debug
+                        val prompt = "Analyze boundary conditions, null safety, and write assertion edge tests for:\n$proposedFileContent"
+                        val result = aiService.executeSinglePrompt(AIModelType.CODE_FORGE, prompt)
+                        step.outputText = result
+                    }
+                    6 -> {
+                        // 7. Diff
+                        val existingFile = currentProjectFiles.value.firstOrNull()
+                        targetFilePath = existingFile?.path ?: "src/Solution.java"
+                        originalFileContent = existingFile?.content ?: "// Empty baseline\n"
+                        val prompt = "Generate a concise summary of changes between Original and Proposed code for $targetFilePath:\nOriginal:\n$originalFileContent\nProposed:\n$proposedFileContent"
+                        val result = aiService.executeSinglePrompt(AIModelType.VISION_STUDIO, prompt)
+                        step.outputText = "Diff Generated for $targetFilePath:\n\n$result"
+                        val diff = FileDiff(
+                            filePath = targetFilePath,
+                            originalContent = originalFileContent,
+                            proposedContent = proposedFileContent,
+                            changeDescription = "Autonomous Agent changes for: $task"
+                        )
+                        _activeDiff.value = diff
+                    }
+                    7 -> {
+                        // 8. Apply
+                        step.outputText = "Diff ready for approval. Click 'Apply' in the diff modal to write changes directly to the project and document, or 'Reject' to discard."
+                        step.codeResult = proposedFileContent
+                    }
                 }
 
-                val model = when (i) {
-                    0 -> AIModelType.ULTRA_PRO
-                    1 -> AIModelType.ARCHITECT
-                    2 -> AIModelType.FLASH_TURBO
-                    3 -> AIModelType.VISION_STUDIO
-                    4 -> AIModelType.CODE_FORGE
-                    else -> AIModelType.FLASH_TURBO
-                }
-
-                val result = aiService.executeSinglePrompt(model, prompt)
-                step.outputText = result
-                step.codeResult = extractCodeBlock(result)
                 step.status = StepStatus.COMPLETED
                 _agentSteps.value = ArrayList(steps)
             }
@@ -464,20 +718,47 @@ $text"""
     fun applyDiffToProject(diff: FileDiff) {
         viewModelScope.launch {
             val projectFiles = currentProjectFiles.value
-            val target = projectFiles.find { it.path == diff.filePath || it.name == diff.filePath }
+            val target = projectFiles.find { it.path == diff.filePath || it.name == diff.filePath || it.path.endsWith(diff.filePath) }
             if (target != null) {
                 projectRepository.updateFileContent(target.id, diff.proposedContent)
+                // Write change to the actual selected document/file on device SAF if linked
+                if (target.realUri != null) {
+                    try {
+                        val context = getApplication<Application>()
+                        context.contentResolver.openOutputStream(Uri.parse(target.realUri), "wt")?.use { out ->
+                            out.write(diff.proposedContent.toByteArray(Charsets.UTF_8))
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                if (_activeFile.value?.id == target.id) {
+                    _activeFile.value = target.copy(content = diff.proposedContent)
+                }
             } else {
-                val selectedId = _selectedProjectId.value
-                if (selectedId != null) {
-                    val name = diff.filePath.substringAfterLast("/")
-                    projectRepository.createFile(
-                        projectId = selectedId,
-                        name = name,
-                        path = diff.filePath,
-                        content = diff.proposedContent,
-                        language = "Kotlin"
-                    )
+                val selectedId = _selectedProjectId.value ?: 1L
+                val name = diff.filePath.substringAfterLast("/")
+                val fileId = projectRepository.createFile(
+                    projectId = selectedId,
+                    name = name,
+                    path = diff.filePath,
+                    content = diff.proposedContent,
+                    language = when {
+                        name.endsWith(".java") -> "Java"
+                        name.endsWith(".cpp") || name.endsWith(".cc") || name.endsWith(".h") -> "C++"
+                        name.endsWith(".xml") -> "XML"
+                        name.endsWith(".py") -> "Python"
+                        name.endsWith(".js") -> "JavaScript"
+                        name.endsWith(".ts") -> "TypeScript"
+                        name.endsWith(".html") -> "HTML"
+                        name.endsWith(".css") -> "CSS"
+                        name.endsWith(".sql") -> "SQL"
+                        name.endsWith(".json") -> "JSON"
+                        else -> "Kotlin"
+                    }
+                )
+                val newFile = projectRepository.getFileById(fileId)
+                if (newFile != null) {
+                    _activeFile.value = newFile
                 }
             }
             _activeDiff.value = null
@@ -528,6 +809,16 @@ $text"""
         viewModelScope.launch {
             val file = _activeFile.value ?: return@launch
             projectRepository.updateFileContent(file.id, content)
+            // Write directly to actual physical document if selected from storage
+            if (file.realUri != null) {
+                try {
+                    val context = getApplication<Application>()
+                    context.contentResolver.openOutputStream(Uri.parse(file.realUri), "wt")?.use { out ->
+                        out.write(content.toByteArray(Charsets.UTF_8))
+                    }
+                } catch (_: Exception) {
+                }
+            }
             _activeFile.value = file.copy(content = content)
         }
     }
@@ -545,7 +836,28 @@ $text"""
                     name = fileName,
                     path = "imported/$fileName",
                     content = content,
-                    language = fileName.substringAfterLast(".", "txt")
+                    language = fileName.substringAfterLast(".", "txt"),
+                    realUri = uri.toString()
+                )
+                val newFile = projectRepository.getFileById(fileId)
+                setActiveFile(newFile)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun importDocumentTree(treeUri: Uri) {
+        viewModelScope.launch {
+            try {
+                val projId = _selectedProjectId.value ?: 1L
+                val folderName = treeUri.lastPathSegment?.substringAfterLast(":")?.substringAfterLast("/") ?: "MountedFolder"
+                val fileId = projectRepository.createFile(
+                    projectId = projId,
+                    name = "$folderName/",
+                    path = "tree/$folderName/",
+                    content = "// Mounted Folder from Storage Access Framework\n// Path: $treeUri",
+                    language = "folder",
+                    realUri = treeUri.toString()
                 )
                 val newFile = projectRepository.getFileById(fileId)
                 setActiveFile(newFile)

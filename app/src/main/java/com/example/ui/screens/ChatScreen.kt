@@ -1,10 +1,14 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -39,6 +43,7 @@ import com.example.ui.MainViewModel
 import com.example.ui.components.FloatingChatComposer
 import com.example.ui.components.SyntaxHighlightedCodeBlock
 import com.example.ui.theme.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -66,6 +71,12 @@ fun ChatScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let { viewModel.importLocalFile(it) }
+    }
+
+    val folderPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        uri?.let { viewModel.importDocumentTree(it) }
     }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -155,18 +166,24 @@ fun ChatScreen(
                         .weight(1f)
                         .fillMaxWidth()
                         .padding(horizontal = 14.dp),
-                    contentPadding = PaddingValues(top = 8.dp, bottom = 80.dp),
+                    contentPadding = PaddingValues(top = 8.dp, bottom = 110.dp),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
+                    val lastAssistantMessageId = messages.lastOrNull { it.role == "assistant" }?.id
                     items(messages) { message ->
                         ChatMessageItem(
                             message = message,
+                            isGenerating = isGenerating,
+                            isLatestAssistant = (message.id == lastAssistantMessageId),
                             onApplyDiff = { diff ->
                                 viewModel.applyDiffToProject(diff)
                             },
                             onPreviewImage = { uri ->
                                 previewImageUri = uri
-                            }
+                            },
+                            onRetry = { viewModel.retryLastMessage() },
+                            onRegenerate = { viewModel.regenerateLastResponse() },
+                            onOpenModelSelector = onOpenModelSelector
                         )
                     }
                 }
@@ -190,6 +207,17 @@ fun ChatScreen(
             onRemoveAttachment = { viewModel.clearAttachment() },
             attachedImageUri = attachedImageUri,
             onRemoveImage = { viewModel.clearImage() },
+            projectFiles = projectFiles,
+            onSelectProjectFile = { file ->
+                viewModel.attachFile(
+                    AttachedFileRef(
+                        name = file.name,
+                        path = file.path,
+                        content = file.content,
+                        realUri = file.realUri
+                    )
+                )
+            },
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
@@ -252,14 +280,31 @@ fun ChatScreen(
                     AttachedFileRef(
                         name = file.name,
                         path = file.path,
-                        content = file.content
+                        content = file.content,
+                        realUri = file.realUri
                     )
                 )
+                val refText = "@${file.name}"
+                val currentText = chatInputText
+                if (!currentText.contains(refText)) {
+                    val updated = if (currentText.endsWith("@")) {
+                        currentText.dropLast(1) + "$refText "
+                    } else if (currentText.isEmpty()) {
+                        "$refText "
+                    } else {
+                        "$currentText $refText "
+                    }
+                    viewModel.updateChatInputText(updated)
+                }
                 showFileSelectorDialog = false
             },
             onPickLocalFile = {
                 showFileSelectorDialog = false
                 filePickerLauncher.launch(arrayOf("*/*"))
+            },
+            onPickLocalFolder = {
+                showFileSelectorDialog = false
+                folderPickerLauncher.launch(null)
             },
             onDismiss = { showFileSelectorDialog = false }
         )
@@ -269,10 +314,25 @@ fun ChatScreen(
 @Composable
 fun ChatMessageItem(
     message: ChatMessageEntity,
+    isGenerating: Boolean,
+    isLatestAssistant: Boolean,
     onApplyDiff: (FileDiff) -> Unit,
-    onPreviewImage: (String) -> Unit = {}
+    onPreviewImage: (String) -> Unit = {},
+    onRetry: () -> Unit = {},
+    onRegenerate: () -> Unit = {},
+    onOpenModelSelector: () -> Unit = {}
 ) {
     val isUser = message.role == "user"
+    val isErrorMessage = message.content == "Unable to generate a response. Please try again."
+    val context = LocalContext.current
+    var copiedState by remember { mutableStateOf(false) }
+
+    LaunchedEffect(copiedState) {
+        if (copiedState) {
+            delay(2000)
+            copiedState = false
+        }
+    }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -291,153 +351,330 @@ fun ChatMessageItem(
             )
         }
 
-        // Message Content Card
-        Surface(
-            modifier = Modifier
-                .widthIn(max = 340.dp)
-                .clip(
-                    RoundedCornerShape(
-                        topStart = 20.dp,
-                        topEnd = 20.dp,
-                        bottomStart = if (isUser) 20.dp else 4.dp,
-                        bottomEnd = if (isUser) 4.dp else 20.dp
-                    )
-                )
-                .border(
-                    1.dp,
-                    if (isUser) AccentCyan.copy(alpha = 0.3f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                    RoundedCornerShape(
-                        topStart = 20.dp,
-                        topEnd = 20.dp,
-                        bottomStart = if (isUser) 20.dp else 4.dp,
-                        bottomEnd = if (isUser) 4.dp else 20.dp
-                    )
-                ),
-            color = if (isUser) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
-                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-        ) {
-            Column(modifier = Modifier.padding(14.dp)) {
-                // Image preview if attached
-                if (message.imageUri != null) {
-                    val context = LocalContext.current
-                    var imageLoadFailed by remember { mutableStateOf(false) }
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 100.dp, max = 240.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(MaterialTheme.colorScheme.surface)
-                            .clickable { onPreviewImage(message.imageUri) },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(File(message.imageUri).takeIf { it.exists() } ?: message.imageUri)
-                                .crossfade(true)
-                                .build(),
-                            contentDescription = "Attached Image (Tap to zoom)",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 100.dp, max = 240.dp),
-                            contentScale = ContentScale.Crop,
-                            onError = { imageLoadFailed = true },
-                            onSuccess = { imageLoadFailed = false }
-                        )
-
-                        if (imageLoadFailed) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.BrokenImage,
-                                    contentDescription = null,
-                                    tint = AccentRose,
-                                    modifier = Modifier.size(32.dp)
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Image preview unavailable",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = AccentRose
-                                )
-                            }
-                        } else {
-                            // Subtle zoom badge
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.BottomEnd)
-                                    .padding(6.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color.Black.copy(alpha = 0.6f))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.ZoomIn,
-                                        contentDescription = "Zoom",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(3.dp))
-                                    Text(
-                                        text = "Zoom",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
-                                        color = Color.White
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                }
-
-                // Attached File Header
-                if (message.attachedFileName != null) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(AccentCyanBright.copy(alpha = 0.15f))
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+        if (isErrorMessage) {
+            // Error Card as explicitly requested by user
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = 340.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .border(1.dp, AccentRose.copy(alpha = 0.5f), RoundedCornerShape(20.dp)),
+                color = AccentRose.copy(alpha = 0.12f)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.Default.Description,
+                            imageVector = Icons.Default.ErrorOutline,
                             contentDescription = null,
-                            tint = AccentCyanBright,
-                            modifier = Modifier.size(14.dp)
+                            tint = AccentRose,
+                            modifier = Modifier.size(20.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = message.attachedFileName,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = AccentCyanBright,
-                            fontWeight = FontWeight.Bold
+                            text = "Generation Notice",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = AccentRose
                         )
                     }
                     Spacer(modifier = Modifier.height(8.dp))
-                }
-
-                // Render text / code blocks
-                RenderMarkdownContent(
-                    content = message.content,
-                    onApplyCode = { code ->
-                        if (message.attachedFileName != null && message.attachedFileContent != null) {
-                            onApplyDiff(
-                                FileDiff(
-                                    filePath = message.attachedFileName,
-                                    originalContent = message.attachedFileContent,
-                                    proposedContent = code,
-                                    changeDescription = "Applied from AI suggestion"
-                                )
+                    Text(
+                        text = "Unable to generate a response. Please try again.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(14.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = onRetry,
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = AccentRose,
+                                contentColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Retry",
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Retry", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                        }
+                        OutlinedButton(
+                            onClick = onOpenModelSelector,
+                            shape = RoundedCornerShape(12.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Tune,
+                                contentDescription = "Change Model",
+                                tint = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                "Change Model",
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                color = MaterialTheme.colorScheme.onSurface
                             )
                         }
                     }
-                )
+                }
+            }
+        } else {
+            // Standard message content card
+            Surface(
+                modifier = Modifier
+                    .widthIn(max = 340.dp)
+                    .clip(
+                        RoundedCornerShape(
+                            topStart = 20.dp,
+                            topEnd = 20.dp,
+                            bottomStart = if (isUser) 20.dp else 4.dp,
+                            bottomEnd = if (isUser) 4.dp else 20.dp
+                        )
+                    )
+                    .border(
+                        1.dp,
+                        if (isUser) AccentCyan.copy(alpha = 0.3f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                        RoundedCornerShape(
+                            topStart = 20.dp,
+                            topEnd = 20.dp,
+                            bottomStart = if (isUser) 20.dp else 4.dp,
+                            bottomEnd = if (isUser) 4.dp else 20.dp
+                        )
+                    ),
+                color = if (isUser) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    // Image preview if attached
+                    if (message.imageUri != null) {
+                        var imageLoadFailed by remember { mutableStateOf(false) }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 100.dp, max = 240.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surface)
+                                .clickable { onPreviewImage(message.imageUri) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(File(message.imageUri).takeIf { it.exists() } ?: message.imageUri)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = "Attached Image (Tap to zoom)",
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 100.dp, max = 240.dp),
+                                contentScale = ContentScale.Crop,
+                                onError = { imageLoadFailed = true },
+                                onSuccess = { imageLoadFailed = false }
+                            )
+
+                            if (imageLoadFailed) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.BrokenImage,
+                                        contentDescription = null,
+                                        tint = AccentRose,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Image preview unavailable",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = AccentRose
+                                    )
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(6.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color.Black.copy(alpha = 0.6f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            imageVector = Icons.Default.ZoomIn,
+                                            contentDescription = "Zoom",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(3.dp))
+                                        Text(
+                                            text = "Zoom",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                            color = Color.White
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    // Attached File Header
+                    if (message.attachedFileName != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(AccentCyanBright.copy(alpha = 0.15f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Description,
+                                contentDescription = null,
+                                tint = AccentCyanBright,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = message.attachedFileName,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AccentCyanBright,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+
+                    // Streaming Placeholder Animation
+                    if (!isUser && message.content.isEmpty() && isGenerating && isLatestAssistant) {
+                        val infiniteTransition = rememberInfiniteTransition(label = "pulsing_dots")
+                        val dotAlpha by infiniteTransition.animateFloat(
+                            initialValue = 0.3f,
+                            targetValue = 1.0f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(700, easing = LinearEasing),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "dotAlpha"
+                        )
+                        Row(
+                            modifier = Modifier.padding(vertical = 12.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(AccentCyanBright.copy(alpha = dotAlpha)))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(AccentCyanBright.copy(alpha = (dotAlpha + 0.3f).coerceAtMost(1f))))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(AccentCyanBright.copy(alpha = dotAlpha)))
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "${message.modelUsed} is generating...",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } else {
+                        // Render text / code blocks
+                        RenderMarkdownContent(
+                            content = message.content,
+                            onApplyCode = { code ->
+                                if (message.attachedFileName != null && message.attachedFileContent != null) {
+                                    onApplyDiff(
+                                        FileDiff(
+                                            filePath = message.attachedFileName,
+                                            originalContent = message.attachedFileContent,
+                                            proposedContent = code,
+                                            changeDescription = "Applied from AI suggestion"
+                                        )
+                                    )
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Message Actions Bar (Copy / Regenerate)
+            if (message.content.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .padding(top = 4.dp, start = 4.dp, end = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    // Copy button
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val clip = ClipData.newPlainText("Message", message.content)
+                                clipboard.setPrimaryClip(clip)
+                                copiedState = true
+                            },
+                        color = Color.Transparent
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (copiedState) Icons.Default.Check else Icons.Default.ContentCopy,
+                                contentDescription = "Copy message",
+                                tint = if (copiedState) AccentCyanBright else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (copiedState) "Copied" else "Copy",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                color = if (copiedState) AccentCyanBright else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+
+                    // Regenerate button for assistant
+                    if (!isUser && !isGenerating) {
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { onRegenerate() },
+                            color = Color.Transparent
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Regenerate",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Regenerate",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -571,10 +808,10 @@ fun ChatEmptyState(
         Spacer(modifier = Modifier.height(12.dp))
 
         val suggestions = listOf(
-            "Write a C++ native JNI bridge for matrix operations",
-            "Generate an Android XML ConstraintLayout with glass styling",
-            "Explain and optimize Java memory allocations in this loop",
-            "Refactor this Kotlin coroutine flow for error boundaries"
+            "@MainActivity.java explain architecture and propose improvements",
+            "Write a native C++ JNI bridge for matrix computations",
+            "Generate an Android XML layout with Code Studio styling",
+            "Optimize Java memory allocations and thread pooling"
         )
 
         Column(
@@ -618,6 +855,7 @@ fun FileAttachmentDialog(
     projectFiles: List<ProjectFileEntity>,
     onSelectFile: (ProjectFileEntity) -> Unit,
     onPickLocalFile: () -> Unit,
+    onPickLocalFolder: () -> Unit = {},
     onDismiss: () -> Unit
 ) {
     Dialog(onDismissRequest = onDismiss) {
@@ -636,7 +874,7 @@ fun FileAttachmentDialog(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Attach File (@)",
+                        text = "Attach File / Folder (@)",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -647,7 +885,7 @@ fun FileAttachmentDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Option to pick from Phone Storage
+                // Option to pick from Phone Storage (File)
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -657,11 +895,11 @@ fun FileAttachmentDialog(
                     color = AccentCyanBright.copy(alpha = 0.1f)
                 ) {
                     Row(
-                        modifier = Modifier.padding(14.dp),
+                        modifier = Modifier.padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
-                            imageVector = Icons.Default.FolderOpen,
+                            imageVector = Icons.Default.Description,
                             contentDescription = null,
                             tint = AccentCyanBright,
                             modifier = Modifier.size(20.dp)
@@ -675,7 +913,45 @@ fun FileAttachmentDialog(
                                 color = AccentCyanBright
                             )
                             Text(
-                                text = "Browse storage for code files & assets",
+                                text = "Browse storage for code files & documents",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // Option to mount a Folder from Storage Access Framework
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable(onClick = onPickLocalFolder)
+                        .border(1.dp, AccentPurple.copy(alpha = 0.5f), RoundedCornerShape(12.dp)),
+                    color = AccentPurple.copy(alpha = 0.1f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FolderOpen,
+                            contentDescription = null,
+                            tint = AccentPurple,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Mount Project Folder",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = AccentPurple
+                            )
+                            Text(
+                                text = "Select an entire folder or repository directory",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

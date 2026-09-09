@@ -4,7 +4,9 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -28,6 +30,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.data.db.ProjectFileEntity
 import com.example.data.model.AttachedFileRef
 import com.example.ui.theme.*
 import java.io.File
@@ -45,9 +48,23 @@ fun FloatingChatComposer(
     onRemoveAttachment: () -> Unit,
     attachedImageUri: String? = null,
     onRemoveImage: () -> Unit = {},
+    projectFiles: List<ProjectFileEntity> = emptyList(),
+    onSelectProjectFile: (ProjectFileEntity) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val haptic = LocalHapticFeedback.current
+
+    // Detect if user is typing an @ mention
+    val atIndex = text.lastIndexOf('@')
+    val isMentionActive = atIndex != -1 && (atIndex == text.length - 1 || !text.substring(atIndex).contains(" "))
+    val mentionQuery = if (isMentionActive && atIndex < text.length - 1) text.substring(atIndex + 1).trim() else ""
+
+    val matchingFiles = remember(mentionQuery, projectFiles, isMentionActive) {
+        if (!isMentionActive) emptyList()
+        else projectFiles.filter {
+            mentionQuery.isEmpty() || it.name.contains(mentionQuery, ignoreCase = true)
+        }.take(6)
+    }
 
     Surface(
         modifier = modifier
@@ -60,6 +77,88 @@ fun FloatingChatComposer(
         tonalElevation = 6.dp
     ) {
         Column(modifier = Modifier.padding(8.dp)) {
+            // Inline @ Autocomplete suggestions bar
+            AnimatedVisibility(visible = isMentionActive && matchingFiles.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 4.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "LINK:",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, letterSpacing = 1.sp),
+                        fontWeight = FontWeight.Bold,
+                        color = AccentCyanBright
+                    )
+                    matchingFiles.forEach { file ->
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.TextHandleMove)
+                                    onSelectProjectFile(file)
+                                    // Replace the trailing @... with @filename
+                                    val prefix = text.substring(0, atIndex)
+                                    onTextChange("$prefix@${file.name} ")
+                                },
+                            shape = RoundedCornerShape(8.dp),
+                            color = AccentCyanBright.copy(alpha = 0.15f),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, AccentCyanBright.copy(alpha = 0.4f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Code,
+                                    contentDescription = null,
+                                    tint = AccentCyanBright,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "@${file.name}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AccentCyanBright,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                onTriggerFilePicker()
+                            },
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.FolderOpen,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Browse storage...",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
             // Attached File Pill (if any)
             AnimatedVisibility(visible = attachedFile != null) {
                 attachedFile?.let { file ->

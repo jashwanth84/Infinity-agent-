@@ -36,6 +36,7 @@ data class AgentStepData(
     val modelDisplayName: String,
     val icon: ImageVector,
     var status: StepStatus = StepStatus.IDLE,
+    var toolBadge: String? = null,
     var outputText: String = "",
     var codeResult: String? = null
 )
@@ -129,6 +130,21 @@ fun AgentStepCard(
                                 fontWeight = FontWeight.SemiBold,
                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                             )
+                        }
+                        if (step.toolBadge != null) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = AccentCyanBright.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = step.toolBadge!!,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AccentCyanBright,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
                         }
                     }
                     Text(

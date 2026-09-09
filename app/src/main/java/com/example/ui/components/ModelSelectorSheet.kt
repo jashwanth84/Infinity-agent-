@@ -92,7 +92,6 @@ fun ModelSelectorSheet(
                         AIModelType.VISION_STUDIO -> AccentGreen
                         AIModelType.CODE_FORGE -> AccentAmber
                         AIModelType.ARCHITECT -> AccentIndigo
-                        AIModelType.GEMINI_PRO -> AccentCyan
                     }
 
                     Surface(
@@ -158,14 +157,7 @@ fun ModelSelectorSheet(
                                         )
                                     }
                                 }
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = model.modelId,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
-                                    color = modelColor.copy(alpha = 0.9f),
-                                    fontWeight = FontWeight.Medium
-                                )
-                                Spacer(modifier = Modifier.height(3.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = model.description,
                                     style = MaterialTheme.typography.bodySmall,

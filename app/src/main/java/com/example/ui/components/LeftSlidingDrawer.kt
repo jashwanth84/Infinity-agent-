@@ -173,7 +173,7 @@ fun LeftSlidingDrawerContent(
                     DrawerNavPill(
                         icon = Icons.Default.FolderOpen,
                         title = "Projects",
-                        subtitle = "NDK C++, Compose, Python",
+                        subtitle = "Java, C++, XML",
                         isSelected = currentWorkspaceTab == WorkspaceTab.PROJECTS,
                         accentColor = AccentAmber,
                         onClick = {

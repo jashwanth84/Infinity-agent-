@@ -44,15 +44,18 @@ enum class AIModelType(
         badge = "Systems Design",
         description = "Cross-language engineering, schemas, and complex workflows",
         supportsVision = false
-    ),
-    GEMINI_PRO(
-        modelId = "gemini-3.1-pro-preview",
-        displayName = "Infinity Gemini",
-        badge = "High Thinking",
-        description = "Gemini intelligence with deep thinking capability",
-        supportsVision = true,
-        isReasoning = true
     )
+}
+
+enum class InternalToolType(val toolName: String, val description: String, val isDestructive: Boolean = false) {
+    LIST_FILES("list files", "List all project and workspace files"),
+    READ_FILE("read file", "Read contents of a specific file"),
+    SEARCH_FILES("search files", "Search code patterns across files"),
+    CREATE_FILE("create file", "Create a new file in workspace"),
+    EDIT_FILE("edit file", "Update content of an existing file"),
+    RENAME_FILE("rename file", "Rename or move a file"),
+    CREATE_FOLDER("create folder", "Create a directory in project"),
+    DELETE_FILE("delete file", "Permanently remove a file", isDestructive = true)
 }
 
 enum class AppMode(val title: String, val subtitle: String) {
@@ -219,5 +222,6 @@ data class AttachedFileRef(
     val name: String,
     val path: String,
     val content: String,
-    val isLocalDevice: Boolean = false
+    val isLocalDevice: Boolean = false,
+    val realUri: String? = null
 )

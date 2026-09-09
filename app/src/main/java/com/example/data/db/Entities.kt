@@ -20,6 +20,7 @@ data class ProjectFileEntity(
     val path: String,
     val content: String,
     val language: String,
+    val realUri: String? = null,
     val updatedAt: Long = System.currentTimeMillis()
 )
 

@@ -47,6 +47,9 @@ interface ProjectFileDao {
     @Query("UPDATE project_files SET name = :newName, path = :newPath WHERE id = :id")
     suspend fun renameFile(id: Long, newName: String, newPath: String)
 
+    @Query("SELECT * FROM project_files WHERE projectId = :projectId AND (name LIKE '%' || :query || '%' OR content LIKE '%' || :query || '%') ORDER BY name ASC")
+    suspend fun searchFiles(projectId: Long, query: String): List<ProjectFileEntity>
+
     @Query("DELETE FROM project_files WHERE id = :id")
     suspend fun deleteFileById(id: Long)
 
@@ -70,6 +73,9 @@ interface ChatDao {
 
     @Query("DELETE FROM chat_messages WHERE sessionId = :sessionId")
     suspend fun clearSession(sessionId: String)
+
+    @Query("DELETE FROM chat_messages WHERE id = :id")
+    suspend fun deleteMessage(id: Long)
 
     @Query("SELECT DISTINCT sessionId FROM chat_messages ORDER BY timestamp DESC")
     fun getAllSessions(): Flow<List<String>>

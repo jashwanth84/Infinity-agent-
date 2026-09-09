@@ -1,6 +1,5 @@
 package com.example.data.api
 
-import android.util.Base64
 import com.example.BuildConfig
 import com.example.data.model.AIModelType
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +29,11 @@ data class MessagePayload(
     val imageBase64: String? = null
 )
 
+/**
+ * Privacy-Preserving Neural Engine Service.
+ * Ensures zero exposure of keys, headers, endpoints, or provider details.
+ * Technical errors are sanitized to user-friendly messages.
+ */
 class AIService {
     private val client = OkHttpClient.Builder()
         .connectTimeout(45, TimeUnit.SECONDS)
@@ -38,16 +42,17 @@ class AIService {
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
-    private val baseUrl = "https://integrate.api.nvidia.com/v1/chat/completions"
+    private val secureGatewayUrl = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-    private fun getApiKeyForModel(modelType: AIModelType): String {
+    private val fallbackMessage = "Unable to generate a response. Please try again."
+
+    private fun resolveModelSecret(modelType: AIModelType): String {
         return when (modelType) {
             AIModelType.VISION_STUDIO -> BuildConfig.NV_KEY_KIMI
             AIModelType.ULTRA_PRO -> BuildConfig.NV_KEY_DEEPSEEK_PRO
             AIModelType.FLASH_TURBO -> BuildConfig.NV_KEY_DEEPSEEK_FLASH
             AIModelType.ARCHITECT -> BuildConfig.NV_KEY_MUSE
             AIModelType.CODE_FORGE -> BuildConfig.NV_KEY_LAGUNA
-            AIModelType.GEMINI_PRO -> BuildConfig.GEMINI_API_KEY.ifEmpty { BuildConfig.NV_KEY_DEEPSEEK_PRO }
         }
     }
 
@@ -56,29 +61,19 @@ class AIService {
         messages: List<MessagePayload>,
         systemPrompt: String? = null
     ): Flow<AIStreamChunk> = flow {
-        val nvKey = getApiKeyForModel(modelType)
-        val geminiKey = BuildConfig.GEMINI_API_KEY
+        val modelSecret = resolveModelSecret(modelType)
+        val backupSecret = BuildConfig.GEMINI_API_KEY
 
-        // Check if we should use Gemini API directly or if NV key is missing/default
-        val shouldUseGemini = modelType == AIModelType.GEMINI_PRO || 
-            ((nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_"))
+        val useBackupGateway = (modelSecret.isBlank() || modelSecret.startsWith("DEFAULT_")) &&
+                backupSecret.isNotBlank() && !backupSecret.startsWith("DEFAULT_")
 
-        if (shouldUseGemini && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_")) {
-            if (modelType != AIModelType.GEMINI_PRO && (nvKey.isBlank() || nvKey.startsWith("DEFAULT_"))) {
-                emit(AIStreamChunk(textChunk = "*(Using Gemini 2.5 Flash as ${modelType.displayName} key is unconfigured)*\n\n"))
-            }
-            streamGemini(geminiKey, messages, systemPrompt).collect { emit(it) }
+        if (useBackupGateway) {
+            streamFromBackupGateway(backupSecret, messages, systemPrompt).collect { emit(it) }
             return@flow
         }
 
-        // Check if NV key is missing
-        if (nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) {
-            emit(
-                AIStreamChunk(
-                    textChunk = "⚠️ **API Key Required**\n\nNo valid API key found for **${modelType.displayName}**.\n\nPlease configure your `GEMINI_API_KEY` or `NV_KEY_*` credentials in the **Secrets** panel in AI Studio.",
-                    isFinished = true
-                )
-            )
+        if (modelSecret.isBlank() || modelSecret.startsWith("DEFAULT_")) {
+            emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
             return@flow
         }
 
@@ -141,8 +136,8 @@ class AIService {
         }
 
         val request = Request.Builder()
-            .url(baseUrl)
-            .addHeader("Authorization", "Bearer $nvKey")
+            .url(secureGatewayUrl)
+            .addHeader("Authorization", "Bearer $modelSecret")
             .addHeader("Accept", "text/event-stream")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
             .build()
@@ -152,13 +147,7 @@ class AIService {
         try {
             val response = client.newCall(request).execute()
             if (!response.isSuccessful || response.body == null) {
-                val errorBody = response.body?.string()?.take(500) ?: response.message
-                emit(
-                    AIStreamChunk(
-                        textChunk = "⚠️ **API Error (HTTP ${response.code})**: $errorBody\n\nPlease check your API credentials in the Secrets panel.",
-                        isFinished = true
-                    )
-                )
+                emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
                 return@flow
             }
 
@@ -192,25 +181,25 @@ class AIService {
                             }
                         }
                     } catch (_: Exception) {
-                        // Ignore malformed intermediate chunks
+                        // Ignore malformed chunk
                     }
                 }
                 line = reader.readLine()
             }
             if (!hasEmittedContent) {
-                emit(AIStreamChunk(textChunk = "⚠️ Stream completed without response content.", isFinished = true))
+                emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
             }
-        } catch (e: Exception) {
-            emit(AIStreamChunk(textChunk = "⚠️ Network Connection Error: ${e.localizedMessage ?: e.message}", isFinished = true))
+        } catch (_: Exception) {
+            emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
         }
     }.flowOn(Dispatchers.IO)
 
-    private fun streamGemini(
-        apiKey: String,
+    private fun streamFromBackupGateway(
+        key: String,
         messages: List<MessagePayload>,
         systemPrompt: String?
     ): Flow<AIStreamChunk> = flow {
-        val geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=$apiKey"
+        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=$key"
         val requestJson = JSONObject()
 
         if (!systemPrompt.isNullOrBlank()) {
@@ -254,7 +243,7 @@ class AIService {
         requestJson.put("generationConfig", genConfig)
 
         val request = Request.Builder()
-            .url(geminiUrl)
+            .url(endpoint)
             .addHeader("Content-Type", "application/json")
             .addHeader("Accept", "text/event-stream")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
@@ -265,8 +254,7 @@ class AIService {
         try {
             val response = client.newCall(request).execute()
             if (!response.isSuccessful || response.body == null) {
-                val errorBody = response.body?.string()?.take(500) ?: response.message
-                emit(AIStreamChunk(textChunk = "⚠️ Gemini API Error (HTTP ${response.code}): $errorBody", isFinished = true))
+                emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
                 return@flow
             }
 
@@ -302,10 +290,10 @@ class AIService {
                 line = reader.readLine()
             }
             if (!hasEmittedContent) {
-                emit(AIStreamChunk(textChunk = "⚠️ Empty response received from Gemini API.", isFinished = true))
+                emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
             }
-        } catch (e: Exception) {
-            emit(AIStreamChunk(textChunk = "⚠️ Gemini Connection Error: ${e.localizedMessage ?: e.message}", isFinished = true))
+        } catch (_: Exception) {
+            emit(AIStreamChunk(textChunk = fallbackMessage, isFinished = true))
         }
     }
 
@@ -314,18 +302,18 @@ class AIService {
         prompt: String,
         systemPrompt: String? = null
     ): String = withContext(Dispatchers.IO) {
-        val nvKey = getApiKeyForModel(modelType)
-        val geminiKey = BuildConfig.GEMINI_API_KEY
+        val modelSecret = resolveModelSecret(modelType)
+        val backupSecret = BuildConfig.GEMINI_API_KEY
 
-        val shouldUseGemini = modelType == AIModelType.GEMINI_PRO || 
-            ((nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_"))
+        val useBackupGateway = (modelSecret.isBlank() || modelSecret.startsWith("DEFAULT_")) &&
+                backupSecret.isNotBlank() && !backupSecret.startsWith("DEFAULT_")
 
-        if (shouldUseGemini && geminiKey.isNotBlank() && !geminiKey.startsWith("DEFAULT_")) {
-            return@withContext executeGeminiPrompt(geminiKey, prompt, systemPrompt)
+        if (useBackupGateway) {
+            return@withContext executeFromBackupGateway(backupSecret, prompt, systemPrompt)
         }
 
-        if (nvKey.isBlank() || nvKey.startsWith("DEFAULT_")) {
-            return@withContext "⚠️ API Key Required: Please configure NV_KEY or GEMINI_API_KEY in the Secrets panel."
+        if (modelSecret.isBlank() || modelSecret.startsWith("DEFAULT_")) {
+            return@withContext fallbackMessage
         }
 
         val requestJson = JSONObject()
@@ -349,8 +337,8 @@ class AIService {
         requestJson.put("max_tokens", 4096)
 
         val request = Request.Builder()
-            .url(baseUrl)
-            .addHeader("Authorization", "Bearer $nvKey")
+            .url(secureGatewayUrl)
+            .addHeader("Authorization", "Bearer $modelSecret")
             .addHeader("Accept", "application/json")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
             .build()
@@ -364,22 +352,18 @@ class AIService {
                     val msg = choices.getJSONObject(0).getJSONObject("message")
                     return@withContext msg.optString("content", "")
                 }
-            } else {
-                val err = response.body?.string()?.take(300) ?: response.message
-                return@withContext "⚠️ API Error (HTTP ${response.code}): $err"
             }
-        } catch (e: Exception) {
-            return@withContext "⚠️ Network Error: ${e.localizedMessage ?: e.message}"
+        } catch (_: Exception) {
         }
-        return@withContext "⚠️ No response returned from API."
+        return@withContext fallbackMessage
     }
 
-    private fun executeGeminiPrompt(
-        apiKey: String,
+    private fun executeFromBackupGateway(
+        key: String,
         prompt: String,
         systemPrompt: String?
     ): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+        val endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$key"
         val requestJson = JSONObject()
 
         if (!systemPrompt.isNullOrBlank()) {
@@ -408,7 +392,7 @@ class AIService {
         requestJson.put("generationConfig", genConfig)
 
         val request = Request.Builder()
-            .url(url)
+            .url(endpoint)
             .addHeader("Content-Type", "application/json")
             .post(requestJson.toString().toRequestBody(jsonMediaType))
             .build()
@@ -426,13 +410,10 @@ class AIService {
                         return parts.getJSONObject(0).optString("text", "")
                     }
                 }
-                "⚠️ Empty candidate in Gemini response."
-            } else {
-                val err = response.body?.string()?.take(300) ?: response.message
-                "⚠️ Gemini API Error (HTTP ${response.code}): $err"
             }
-        } catch (e: Exception) {
-            "⚠️ Gemini Connection Error: ${e.localizedMessage ?: e.message}"
+            fallbackMessage
+        } catch (_: Exception) {
+            fallbackMessage
         }
     }
 }
