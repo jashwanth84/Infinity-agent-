@@ -1,0 +1,181 @@
+name: Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v1.0.0). If empty, generates one based on date/run number.'
+        required: false
+        default: ''
+      release_title:
+        description: 'Release Title (e.g. Infinity Agent v1.0.0)'
+        required: false
+        default: ''
+      is_draft:
+        description: 'Create as Draft'
+        type: boolean
+        required: false
+        default: false
+      is_prerelease:
+        description: 'Create as Prerelease'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-apk:
+    name: Build & Release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Grant Execute Permission to Gradlew
+        run: chmod +x ./gradlew
+
+      - name: Prepare Environment File (.env)
+        run: |
+          if [ -n "${{ secrets.ENV_FILE }}" ]; then
+            echo "${{ secrets.ENV_FILE }}" > .env
+            echo "Loaded .env from secrets.ENV_FILE"
+          elif [ ! -f .env ]; then
+            cp .env.example .env
+            echo "Copied .env from .env.example"
+          fi
+
+          # Inject individual secrets if set in GitHub repository
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            sed -i 's|^GEMINI_API_KEY=.*|GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}|' .env || echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          fi
+          if [ -n "${{ secrets.NV_KEY_DEEPSEEK_PRO }}" ]; then
+            sed -i 's|^NV_KEY_DEEPSEEK_PRO=.*|NV_KEY_DEEPSEEK_PRO=${{ secrets.NV_KEY_DEEPSEEK_PRO }}|' .env || echo "NV_KEY_DEEPSEEK_PRO=${{ secrets.NV_KEY_DEEPSEEK_PRO }}" >> .env
+          fi
+          if [ -n "${{ secrets.NV_KEY_DEEPSEEK_FLASH }}" ]; then
+            sed -i 's|^NV_KEY_DEEPSEEK_FLASH=.*|NV_KEY_DEEPSEEK_FLASH=${{ secrets.NV_KEY_DEEPSEEK_FLASH }}|' .env || echo "NV_KEY_DEEPSEEK_FLASH=${{ secrets.NV_KEY_DEEPSEEK_FLASH }}" >> .env
+          fi
+          if [ -n "${{ secrets.NV_KEY_KIMI }}" ]; then
+            sed -i 's|^NV_KEY_KIMI=.*|NV_KEY_KIMI=${{ secrets.NV_KEY_KIMI }}|' .env || echo "NV_KEY_KIMI=${{ secrets.NV_KEY_KIMI }}" >> .env
+          fi
+          if [ -n "${{ secrets.NV_KEY_LAGUNA }}" ]; then
+            sed -i 's|^NV_KEY_LAGUNA=.*|NV_KEY_LAGUNA=${{ secrets.NV_KEY_LAGUNA }}|' .env || echo "NV_KEY_LAGUNA=${{ secrets.NV_KEY_LAGUNA }}" >> .env
+          fi
+          if [ -n "${{ secrets.NV_KEY_MUSE }}" ]; then
+            sed -i 's|^NV_KEY_MUSE=.*|NV_KEY_MUSE=${{ secrets.NV_KEY_MUSE }}|' .env || echo "NV_KEY_MUSE=${{ secrets.NV_KEY_MUSE }}" >> .env
+          fi
+
+      - name: Configure Signing Keystore
+        id: keystore-setup
+        run: |
+          KEYSTORE_FILE="${{ github.workspace }}/my-upload-key.jks"
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "Using custom release keystore provided via secrets.RELEASE_KEYSTORE_BASE64"
+            echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE_FILE"
+            echo "store_password=${{ secrets.STORE_PASSWORD }}" >> $GITHUB_OUTPUT
+            echo "key_password=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_OUTPUT
+          else
+            echo "No custom keystore found in secrets. Generating valid self-signed release keystore for automated release build..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_FILE" \
+              -alias upload \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "android" \
+              -keypass "android" \
+              -dname "CN=InfinityAgent, OU=Mobile, O=AIStudio, L=MountainView, ST=California, C=US"
+            echo "store_password=android" >> $GITHUB_OUTPUT
+            echo "key_password=android" >> $GITHUB_OUTPUT
+          fi
+          echo "keystore_path=$KEYSTORE_FILE" >> $GITHUB_OUTPUT
+
+      - name: Build Release APK with Gradle
+        env:
+          KEYSTORE_PATH: ${{ steps.keystore-setup.outputs.keystore_path }}
+          STORE_PASSWORD: ${{ steps.keystore-setup.outputs.store_password }}
+          KEY_PASSWORD: ${{ steps.keystore-setup.outputs.key_password }}
+        run: |
+          ./gradlew assembleRelease --stacktrace
+
+      - name: Prepare Release Artifacts
+        id: prep-artifacts
+        run: |
+          mkdir -p release-assets
+
+          # Determine version name / tag
+          if [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            TAG="${{ github.event.inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v1.0.${{ github.run_number }}"
+          fi
+
+          TITLE="${{ github.event.inputs.release_title }}"
+          if [ -z "$TITLE" ]; then
+            TITLE="Infinity Agent $TAG"
+          fi
+
+          echo "final_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "final_title=$TITLE" >> $GITHUB_OUTPUT
+
+          # Find release APK
+          ORIGINAL_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$ORIGINAL_APK" ]; then
+            echo "ERROR: Release APK not found!"
+            exit 1
+          fi
+
+          TARGET_APK="release-assets/InfinityAgent-${TAG}.apk"
+          cp "$ORIGINAL_APK" "$TARGET_APK"
+
+          # Generate SHA256 checksum
+          cd release-assets
+          sha256sum "InfinityAgent-${TAG}.apk" > "InfinityAgent-${TAG}.apk.sha256"
+          cd ..
+
+          echo "Packaged APK: $TARGET_APK"
+          ls -lh release-assets/
+
+      - name: Upload Artifact to GitHub Action Run
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfinityAgent-APK-${{ steps.prep-artifacts.outputs.final_tag }}
+          path: release-assets/*
+          retention-days: 30
+
+      - name: Create GitHub Release and Attach APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep-artifacts.outputs.final_tag }}
+          name: ${{ steps.prep-artifacts.outputs.final_title }}
+          files: release-assets/*
+          draft: ${{ github.event.inputs.is_draft || false }}
+          prerelease: ${{ github.event.inputs.is_prerelease || false }}
+          generate_release_notes: true
+          body: |
+            ## 🚀 Infinity Agent Release (${{ steps.prep-artifacts.outputs.final_tag }})
+
+            ### 📦 Downloads:
+            - **Application Package**: `InfinityAgent-${{ steps.prep-artifacts.outputs.final_tag }}.apk`
+            - **Checksum**: Verify integrity with `InfinityAgent-${{ steps.prep-artifacts.outputs.final_tag }}.apk.sha256`
+
+            ### 📱 Compatibility:
+            - Minimum Android SDK: Android 7.0+ (API 24)
+            - Target Android SDK: Android 15/16 (API 36)
+            - Architecture: Universal APK
